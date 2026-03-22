@@ -19,7 +19,7 @@ import sys
 ROOT         = os.path.dirname(os.path.abspath(__file__))
 LISTED_FILE  = os.path.join(ROOT, "data", "demons_listed.json")
 HISTORY_FILE = os.path.join(ROOT, "demons_history.json")
-HTML_OUT     = os.path.join(ROOT, "demonlist.html")
+HTML_OUT     = os.path.join(ROOT, "index.html")
 
 
 def yt_id(url):
@@ -61,7 +61,7 @@ def main():
             sys.exit(1)
 
     if not os.path.exists(HTML_OUT):
-        print(f"ERROR: demonlist.html not found at {HTML_OUT}")
+        print(f"ERROR: index.html not found at {HTML_OUT}")
         sys.exit(1)
 
     # ── Load data ─────────────────────────────────────────────────────────

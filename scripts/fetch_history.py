@@ -4,14 +4,15 @@ fetch_history.py
 Downloads the position history (movement log) for every demon in the
 demonlist and saves it to ../demons_history.json
 
-The output file is used by the Time Machine feature in demonlist.html.
+Incremental mode (default): only fetches demons that are new or whose
+last recorded entry is older than 8 days. Weekly runs are fast.
+
+Full mode (--full): re-fetches every demon regardless of cache.
 
 Usage:
     pip install requests
-    python fetch_history.py
-
-Resume support: if the output file already exists, only missing demons
-are fetched. Safe to interrupt and re-run.
+    python fetch_history.py           # incremental (recommended)
+    python fetch_history.py --full    # full re-fetch
 
 Output format:
     {
@@ -19,8 +20,7 @@ Output format:
         "<demon_id>": [
           {"t": "2019-03-09T18:00:08", "p": 45, "a": false},
           ...
-        ],
-        ...
+        ]
       }
     }
     Fields: t = time (ISO), p = new_position, a = true if reason is "Added"
@@ -30,12 +30,14 @@ import requests
 import json
 import time
 import os
+import sys
+from datetime import datetime, timezone, timedelta
 
 BASE        = "https://pointercrate.com"
 LISTED_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "demons_listed.json")
 OUTPUT      = os.path.join(os.path.dirname(__file__), "..", "demons_history.json")
-DELAY       = 0.4   # seconds between requests
-SAVE_EVERY  = 50    # save progress every N demons
+DELAY       = 0.4
+SAVE_EVERY  = 50
 
 
 def fetch_movement(demon_id):
@@ -52,7 +54,6 @@ def fetch_movement(demon_id):
 
 
 def parse_entries(raw):
-    """Convert raw API entries to compact format."""
     result = []
     for m in raw:
         if not isinstance(m.get("new_position"), int):
@@ -65,80 +66,103 @@ def parse_entries(raw):
     return result
 
 
+def last_entry_date(entries):
+    if not entries:
+        return None
+    try:
+        ts = entries[-1]["t"].replace("Z", "+00:00")
+        return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def needs_update(demon_id, history, full_mode, threshold):
+    if full_mode:
+        return True
+    if demon_id not in history:
+        return True          # new demon, never fetched
+    entries = history[demon_id]
+    if not entries:
+        return True          # previously failed, retry
+    last = last_entry_date(entries)
+    return last is None or last < threshold
+
+
+def _save(history, path):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    out = {"history": {str(k): v for k, v in history.items()}}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, separators=(",", ":"), ensure_ascii=False)
+
+
 def main():
-    # Load demon list
+    full_mode = "--full" in sys.argv
+
     if not os.path.exists(LISTED_FILE):
-        print(f"ERROR: {LISTED_FILE} not found.")
-        print("Run fetch_listed.py first.")
-        return
+        print(f"ERROR: {LISTED_FILE} not found. Run fetch_listed.py first.")
+        sys.exit(1)
 
     demons = json.load(open(LISTED_FILE, encoding="utf-8"))
     demons.sort(key=lambda d: d["id"])
     total = len(demons)
-    print(f"Loaded {total} demons from {LISTED_FILE}")
+    print(f"Loaded {total} demons")
 
-    # Load existing progress
     history = {}
     if os.path.exists(OUTPUT):
-        existing = json.load(open(OUTPUT, encoding="utf-8"))
-        history  = {int(k): v for k, v in existing.get("history", {}).items()}
-        already  = sum(1 for v in history.values() if v is not None)
-        print(f"Resuming — {already}/{total} already fetched\n")
-    else:
-        print("Starting fresh...\n")
+        raw     = json.load(open(OUTPUT, encoding="utf-8"))
+        history = {int(k): v for k, v in raw.get("history", {}).items()}
+        print(f"Existing history: {len(history)} demons cached")
+
+    threshold  = datetime.now(timezone.utc) - timedelta(days=8)
+    to_update  = [d for d in demons if needs_update(d["id"], history, full_mode, threshold)]
+    mode_label = "FULL" if full_mode else "INCREMENTAL"
+
+    print(f"\nMode: {mode_label}")
+    print(f"Demons to fetch: {len(to_update)} / {total}\n")
+
+    if not to_update:
+        print("Everything is up to date.")
+        return
 
     failed = []
     done   = 0
 
-    for i, demon in enumerate(demons, 1):
+    for i, demon in enumerate(to_update, 1):
         did  = demon["id"]
         name = demon["name"]
 
-        if did in history:
-            done += 1
-            continue
-
         raw = fetch_movement(did)
-
-        # Single retry on failure
         if raw is None:
             time.sleep(1.0)
             raw = fetch_movement(did)
 
         if raw is None:
             failed.append(did)
-            history[did] = []
-            print(f"  [{i:4d}/{total}] FAILED  id={did:4d}  {name}")
+            if did not in history:
+                history[did] = []
+            print(f"  [{i:4d}/{len(to_update)}] FAILED  id={did:4d}  {name}")
         else:
             history[did] = parse_entries(raw)
             n = len(history[did])
-            print(f"  [{i:4d}/{total}]  {n:4d} entries  id={did:4d}  {name}")
+            print(f"  [{i:4d}/{len(to_update)}]  {n:4d} entries  id={did:4d}  {name}")
 
         done += 1
         time.sleep(DELAY)
 
-        # Save progress periodically
         if done % SAVE_EVERY == 0:
             _save(history, OUTPUT)
-            print(f"\n  -- Progress saved ({done}/{total}) --\n")
+            print(f"\n  -- Progress saved ({done}/{len(to_update)}) --\n")
 
     _save(history, OUTPUT)
 
     size_kb = os.path.getsize(OUTPUT) / 1024
     print(f"\n{'='*52}")
     print(f"Saved: {OUTPUT}  ({size_kb:.0f} KB)")
-    print(f"Demons with history : {sum(1 for v in history.values() if v)}/{total}")
-    print(f"Demons with no data : {len(failed)}")
+    print(f"Updated : {len(to_update) - len(failed)}")
+    print(f"Failed  : {len(failed)}")
     if failed:
         print(f"Failed IDs: {failed}")
     print(f"{'='*52}")
-
-
-def _save(history, path):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    out = {"history": {str(k): v for k, v in history.items()}}
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, separators=(",", ":"), ensure_ascii=False)
 
 
 if __name__ == "__main__":
